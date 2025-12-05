@@ -24,7 +24,7 @@ if (OUTBOUND_PROXY) {
 
 // 简单内存缓存
 const cache = new Map(); // key -> { ts, data }
-const CACHE_TTL_MS = 8 * 1000; // 缓存 8 秒
+const CACHE_TTL_MS = 8 * 1000; // 缓存 8 秒（可按需调大）
 
 // 简单速率限制（每 IP 每分钟）
 const rateMap = new Map();
@@ -98,7 +98,6 @@ async function getJsonWithFallback(url) {
   for (const wrap of PROXY_WRAPPERS) {
     const proxyUrl = wrap(url);
     try {
-      // 这些请求访问公共代理 URL，本身可能不需要再走 OUTBOUND_PROXY
       const res = await fetchWithTimeout(proxyUrl, {}, 10000);
       if (!res || !res.ok) continue;
       const ct = (res.headers.get('content-type') || '').toLowerCase();
@@ -140,7 +139,7 @@ app.use((req, res, next) => {
 // health
 app.get('/', (req, res) => res.send('🚀 Crypto Proxy is Online'));
 
-// Binance funding rates
+// Binance funding rates (unchanged)
 app.get('/proxy/binance', async (req, res) => {
   const ip = req.ip || req.connection.remoteAddress;
   if (!checkRateLimit(ip)) return res.status(429).json({ error: 'rate limit exceeded' });
@@ -157,24 +156,86 @@ app.get('/proxy/binance', async (req, res) => {
   }
 });
 
-// OKX funding rates
+// helper: 并发限制的批量执行器
+async function mapWithConcurrency(items, worker, concurrency = 6) {
+  const results = [];
+  let i = 0;
+  const run = async () => {
+    while (i < items.length) {
+      const idx = i++;
+      try {
+        results[idx] = await worker(items[idx], idx);
+      } catch (e) {
+        results[idx] = { error: e && e.message ? e.message : String(e) };
+      }
+    }
+  };
+  const runners = [];
+  for (let j = 0; j < Math.min(concurrency, items.length); j++) runners.push(run());
+  await Promise.all(runners);
+  return results;
+}
+
+// OKX funding rates: 先拿 instruments，再分批请求 funding-rate
 app.get('/proxy/okx', async (req, res) => {
   const ip = req.ip || req.connection.remoteAddress;
   if (!checkRateLimit(ip)) return res.status(429).json({ error: 'rate limit exceeded' });
-  const url = 'https://www.okx.com/api/v5/public/funding-rate?instType=SWAP';
+
   try {
-    const raw = await getJsonWithFallback(url);
-    // 兼容多种包装：直接数组、{ data: [...] }, 或代理包装 { contents: "..." }
-    let data = null;
-    if (Array.isArray(raw)) data = raw;
-    else if (raw && Array.isArray(raw.data)) data = raw.data;
-    else if (raw && typeof raw === 'object' && raw.contents) {
-      try { const parsed = JSON.parse(raw.contents); if (Array.isArray(parsed)) data = parsed; } catch(e){}
+    // 1) instruments 列表
+    const instUrl = 'https://www.okx.com/api/v5/public/instruments?instType=SWAP';
+    const instRaw = await getJsonWithFallback(instUrl);
+    const instList = Array.isArray(instRaw) ? instRaw : (instRaw && Array.isArray(instRaw.data) ? instRaw.data : null);
+    if (!instList || instList.length === 0) {
+      return res.status(502).json({ error: 'failed to fetch okx instruments', raw: instRaw });
     }
-    if (!data) {
-      return res.status(502).json({ error: 'unexpected okx response', raw });
+
+    // 提取 instId（去重）
+    const instIds = Array.from(new Set(instList.map(it => it.instId || it.inst_id || it.inst || '').filter(Boolean)));
+    if (instIds.length === 0) {
+      return res.status(502).json({ error: 'no instId found in okx instruments', raw: instList });
     }
-    return res.json({ data });
+
+    // 2) 分批并发请求每个 instId 的 funding-rate
+    const fundingBase = 'https://www.okx.com/api/v5/public/funding-rate?instId=';
+    const results = await mapWithConcurrency(instIds, async (instId) => {
+      const url = fundingBase + encodeURIComponent(instId);
+      try {
+        const r = await getJsonWithFallback(url);
+        if (Array.isArray(r)) return { instId, raw: r };
+        if (r && Array.isArray(r.data)) return { instId, raw: r.data };
+        if (r && r.contents) {
+          try {
+            const parsed = JSON.parse(r.contents);
+            if (Array.isArray(parsed)) return { instId, raw: parsed };
+            if (parsed && Array.isArray(parsed.data)) return { instId, raw: parsed.data };
+          } catch(e){}
+        }
+        return { instId, raw: r };
+      } catch (e) {
+        return { instId, error: e && e.message ? e.message : String(e) };
+      }
+    }, 6); // 并发数可调
+
+    // 3) 合并结果
+    const merged = [];
+    for (const item of results) {
+      if (item && item.raw && Array.isArray(item.raw)) {
+        item.raw.forEach(r => {
+          if (!r.instId && !r.inst_id && item.instId) r.instId = item.instId;
+          merged.push(r);
+        });
+      }
+    }
+
+    if (merged.length === 0) {
+      return res.status(502).json({ error: 'no funding-rate data collected', details: results.slice(0, 20) });
+    }
+
+    // 缓存合并结果（可按需改 key）
+    cache.set('okx_funding_all', { ts: Date.now(), data: merged });
+
+    return res.json({ data: merged });
   } catch (e) {
     console.error('/proxy/okx error', e && e.message);
     return res.status(502).json({ error: 'proxy error', detail: e && e.message });
