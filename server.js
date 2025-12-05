@@ -1,51 +1,66 @@
+// ============ server.js 完整代码开始 ============
+const express = require('express');
+const fetch = require('node-fetch'); // 用于发送请求
+const app = express(); // ！！！这是定义app变量的关键行！！！
+const PORT = process.env.PORT || 3000;
+
+// 1. 允许所有网页跨域访问（安全考虑，上线后可限制域名）
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
+
+// 2. 健康检查端点，防止免费服务休眠，也用于测试
+app.get('/', (req, res) => res.send('🚀 Crypto Proxy is Online'));
+
+// 3. 代理币安资金费率（使用公共代理中转）
 app.get('/proxy/binance', async (req, res) => {
-  // 尝试的公共代理列表（将币安API地址包装起来）
+  // 公共代理地址列表，逐个尝试
   const proxyAttempts = [
-    `https://api.allorigins.win/get?url=${encodeURIComponent('https://fapi.binance.com/fapi/v1/premiumIndex')}`,
     `https://corsproxy.io/?${encodeURIComponent('https://fapi.binance.com/fapi/v1/premiumIndex')}`,
+    `https://api.allorigins.win/get?url=${encodeURIComponent('https://fapi.binance.com/fapi/v1/premiumIndex')}`,
     `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent('https://fapi.binance.com/fapi/v1/premiumIndex')}`
   ];
 
   let lastError = null;
-
   for (const proxyUrl of proxyAttempts) {
     try {
-      console.log(`尝试通过代理访问: ${proxyUrl}`);
+      console.log(`尝试代理: ${proxyUrl}`);
       const response = await fetch(proxyUrl, { timeout: 10000 });
-
       if (!response.ok) continue;
-
+      
       let data = await response.json();
-
-      // 处理不同代理的返回格式
-      // 1. allorigins.win 返回 { contents: JSON字符串 }
+      
+      // 处理 allorigins.win 的特殊包装格式
       if (proxyUrl.includes('allorigins.win')) {
         try {
           data = JSON.parse(data.contents);
         } catch (e) {
-          continue; // 解析失败，尝试下一个代理
+          continue;
         }
       }
-      // 2. 其他代理通常直接返回币安的原始数据
-
-      // 验证是否拿到正确的币安数据
-      if (Array.isArray(data) && data.length > 0 && data[0].symbol && data[0].lastFundingRate !== undefined) {
-        console.log(`✅ 成功通过代理获取币安原始数据`);
-        return res.json(data); // 将币安的原始数据直接传回给你的网页
+      
+      // 验证是否为正确的币安数据
+      if (Array.isArray(data) && data.length > 0 && data[0].lastFundingRate !== undefined) {
+        console.log(`✅ 成功获取数据`);
+        return res.json(data);
       }
-
     } catch (error) {
-      console.warn(`当前代理失败:`, error.message);
+      console.warn(`代理失败:`, error.message);
       lastError = error;
-      await new Promise(r => setTimeout(r, 500)); // 稍作延迟再试下一个
+      await new Promise(r => setTimeout(r, 300));
       continue;
     }
   }
-
-  // 所有代理都失败
-  res.status(500).json({
-    error: '无法通过任何公共代理获取币安数据',
-    detail: lastError?.message,
-    message: '所有中转渠道均暂时不可用。'
+  
+  // 所有尝试都失败
+  res.status(500).json({ 
+    error: '所有公共代理均无法访问币安接口',
+    detail: lastError?.message 
   });
 });
+
+// 4. 启动服务器（这行必须在最后）
+app.listen(PORT, () => console.log(`✅ 代理服务已启动: http://localhost:${PORT}`));
+// ============ server.js 完整代码结束 ============
