@@ -10,14 +10,14 @@
   },
   "dependencies": {
     "express": "^4.18.2",
-    "node-fetch": "^2.7.0",  // 升级到2.7.0
+    "node-fetch": "^2.7.0",
     "abort-controller": "^3.0.0",
-    "https-proxy-agent": "^7.0.2",  // 升级到7.0.2
-    "compression": "^1.7.4",  // 新增：响应压缩
-    "helmet": "^7.0.0"  // 新增：安全头
+    "https-proxy-agent": "^7.0.2",
+    "compression": "^1.7.4",
+    "helmet": "^7.0.0"
   },
   "engines": {
-    "node": ">=18.0.0"  // 新增：指定Node.js版本
+    "node": ">=18.0.0"
   },
   "keywords": [
     "crypto",
