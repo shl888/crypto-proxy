@@ -19,7 +19,7 @@ const CONFIG = {
   // 请求超时
   TIMEOUT_DIRECT: 7000,
   TIMEOUT_PROXY: 10000,
-  TIMEOUT_SHORT: 8000,       // 短请求超时 8s
+  TIMEOUT_SHORT: 10000,       // 短请求超时 10s
 
   // 并发限制
   CONCURRENCY_LIMIT: 4,      // 全局并发上限（影响 OKX perBatch）
@@ -352,7 +352,7 @@ async function getOKXData() {
     console.log(`📊 计划请求 ${instIds.length} 个OKX instId 的 funding-rate（分批处理）`);
 
     // 分批并发参数（可调）
-    const perBatch = Math.min(CONFIG.CONCURRENCY_LIMIT || 4, 8); // 每批并发数
+    const perBatch = Math.min(CONFIG.CONCURRENCY_LIMIT || 4, 6); // 每批并发数
     const interBatchDelay = 500; // 毫秒，批与批之间的延迟
     const perRequestRetry = 2; // 单请求重试次数
 
