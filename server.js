@@ -379,7 +379,68 @@ async function smartFetch(url, options = {}, context = {}) {
   throw lastError || new Error('Fetch failed after retries');
 }
 
-// ========== 数据获取函数 ==========
+// ========== 归一化工具函数 ==========
+function toMsTimestamp(val) {
+  if (val == null) return null;
+  const n = Number(val);
+  if (Number.isFinite(n)) {
+    // 如果看起来像毫秒（>1e12），直接返回；如果像秒（>1e9），乘1000
+    if (n > 1e12) return n;
+    if (n > 1e9) return n * 1000;
+  }
+  // 尝试解析为日期字符串
+  const d = new Date(String(val));
+  if (!isNaN(d.getTime())) return d.getTime();
+  return null;
+}
+
+function normalizeBinanceArray(data, sourceLabel = 'binance') {
+  if (!Array.isArray(data)) return [];
+  return data.map(item => {
+    const symbol = String(item.symbol || item.s || '').trim();
+    const lastFundingRateRaw = item.lastFundingRate ?? item.lastFundingRateStr ?? item.fundingRate ?? item.funding_rate ?? null;
+    const lastFundingRate = lastFundingRateRaw != null ? parseFloat(lastFundingRateRaw) : null;
+
+    const nextFundingTime = toMsTimestamp(item.nextFundingTime ?? item.nextFundingTimeMs ?? item.nextFundingTimeStamp ?? item.nextFundingTimeUtc ?? null);
+    const lastFundingTime = toMsTimestamp(item.time ?? item.lastFundingTime ?? item.lastFundingTimeMs ?? null);
+
+    return {
+      symbol,
+      source: sourceLabel,
+      lastFundingRate: Number.isFinite(lastFundingRate) ? lastFundingRate : null,
+      nextFundingTime,
+      lastFundingTime,
+      markPrice: item.markPrice ?? item.lastPrice ?? null,
+      raw: item
+    };
+  }).filter(x => x.symbol && /USDT$/i.test(x.symbol));
+}
+
+function normalizeOkxArray(items, sourceLabel = 'okx') {
+  if (!Array.isArray(items)) return [];
+  return items.map(item => {
+    const instId = item.instId || item.inst_id || item.inst || item.instrumentId || item.instrument_id || item.symbol;
+    const symbolBase = instId ? String(instId).replace(/-USDT-?SWAP$/i,'').replace(/-SWAP$/i,'').replace(/USDT$/i,'').replace(/_USDT$/i,'').trim() : null;
+    const symbol = symbolBase ? (symbolBase + 'USDT') : null;
+
+    const lastFundingRateRaw = item.fundingRate ?? item.lastFundingRate ?? item.funding_rate ?? item.fundingRate24h ?? item.lastFundingRateStr ?? item.rate ?? null;
+    const lastFundingRate = lastFundingRateRaw != null ? parseFloat(lastFundingRateRaw) : null;
+
+    const nextFundingTime = toMsTimestamp(item.nextFundingTime ?? item.nextFundingTimeUTC ?? item.nextFundingTimeMs ?? item.nextFundingTimeStamp ?? item.nextFundingTimeUtc ?? item.nextFunding ?? null);
+    const lastFundingTime = toMsTimestamp(item.fundingTime ?? item.fundingTimeUTC ?? item.fundingTimeMs ?? item.fundingTimeStamp ?? item.lastFundingTime ?? item.lastFunding ?? null);
+
+    return {
+      symbol,
+      source: sourceLabel,
+      lastFundingRate: Number.isFinite(lastFundingRate) ? lastFundingRate : null,
+      nextFundingTime,
+      lastFundingTime,
+      raw: item
+    };
+  }).filter(x => x.symbol);
+}
+
+// ========== 数据获取函数（归一化输出） ==========
 async function getBinanceData() {
   const cacheKey = 'binance_premiumIndex';
   const cached = cache.get(cacheKey);
@@ -406,65 +467,55 @@ async function getBinanceData() {
       
       const data = await response.json();
       
-      // 数据验证
+      // 期望 data 为数组
       if (!Array.isArray(data) || data.length === 0) {
         console.warn(`⚠️ [${source}]: 数据格式无效`);
         continue;
       }
       
-      const sample = data[0];
-      if (!sample?.symbol || typeof sample.lastFundingRate === 'undefined') {
-        console.warn(`⚠️ [${source}]: 数据字段缺失`);
+      const normalized = normalizeBinanceArray(data, source);
+      if (normalized.length === 0) {
+        console.warn(`⚠️ [${source}]: 无有效归一化数据`);
         continue;
       }
       
-      // 过滤无效数据
-      const validData = data.filter(item => 
-        item.symbol && 
-        typeof item.lastFundingRate === 'string' &&
-        !isNaN(parseFloat(item.lastFundingRate))
-      );
+      console.log(`✅ [${source}]: 成功获取 ${normalized.length} 个交易对（归一化）`);
       
-      if (validData.length === 0) {
-        console.warn(`⚠️ [${source}]: 无有效数据`);
-        continue;
-      }
-      
-      console.log(`✅ [${source}]: 成功获取 ${validData.length} 个交易对`);
-      
-      cache.set(cacheKey, validData, CONFIG.CACHE_TTL_BINANCE, {
+      cache.set(cacheKey, normalized, CONFIG.CACHE_TTL_BINANCE, {
         source,
-        count: validData.length,
+        count: normalized.length,
         timestamp: new Date().toISOString()
       });
       
-      return validData;
+      return normalized;
       
     } catch (error) {
       console.warn(`❌ [${source}] 失败:`, error.message);
     }
   }
   
-  // 所有源都失败，尝试紧急备用
+  // 所有源都失败，尝试紧急备用（24hr ticker -> 转换为兼容格式，但标注为 backup）
   try {
     console.log('🚨 尝试紧急备用源...');
     const backupUrl = 'https://api.binance.com/api/v3/ticker/24hr';
     const response = await smartFetch(backupUrl, { timeout: CONFIG.TIMEOUT_SHORT });
     const backupData = await response.json();
     
-    console.log('⚠️ 使用24小时价格数据作为备用');
+    console.log('⚠️ 使用24小时价格数据作为备用（会被标注为 backup）');
     
-    // 转换格式以保持兼容性
-    const formattedData = Array.isArray(backupData) ? backupData.slice(0, 50).map(item => ({
-      symbol: item.symbol,
-      lastFundingRate: '0.0001', // 默认值
-      markPrice: item.lastPrice,
-      indexPrice: item.weightedAvgPrice
-    })) : [];
+    const formattedData = Array.isArray(backupData) ? backupData.slice(0, 200).map(item => ({
+      symbol: String(item.symbol || '').trim(),
+      source: 'binance_backup',
+      lastFundingRate: null, // 无法从 ticker 得到 fundingRate，保留 null
+      nextFundingTime: null,
+      lastFundingTime: null,
+      markPrice: item.lastPrice ?? null,
+      raw: item
+    })).filter(x => x.symbol && /USDT$/i.test(x.symbol)) : [];
     
     if (formattedData.length > 0) {
       cache.set(cacheKey, formattedData, CONFIG.CACHE_TTL_BINANCE, {
-        source: 'emergency',
+        source: 'backup',
         warning: '使用备用数据源'
       });
       
@@ -521,36 +572,39 @@ async function getOKXData() {
     
     // 智能选择交易对：优先永续合约，限制数量
     const instIds = [...new Set(instList
-      .filter(it => it.instId && it.instId.includes('-SWAP'))
-      .map(it => it.instId)
+      .filter(it => (it.instId || it.inst_id || it.inst || it.instrumentId || it.instrument_id) && String(it.instId || it.inst_id || it.inst || it.instrumentId || it.instrument_id).includes('-SWAP'))
+      .map(it => it.instId || it.inst_id || it.inst || it.instrumentId || it.instrument_id)
       .slice(0, CONFIG.OKX_BATCH_SIZE)
     )];
     
-    console.log(`📊 选取 ${instIds.length} 个OKX交易对`);
+    console.log(`📊 选取 ${instIds.length} 个OKX交易对进行资金费率请求`);
     
-    // 分批获取资金费率
+    // 分批获取资金费率（并发受限）
     const fundingResults = [];
-    const batchSize = Math.min(CONFIG.CONCURRENCY_LIMIT, 5);
+    const batchSize = Math.min(CONFIG.CONCURRENCY_LIMIT, 6);
     
     for (let i = 0; i < instIds.length; i += batchSize) {
       const batch = instIds.slice(i, i + batchSize);
       const batchPromises = batch.map(async (instId, index) => {
-        await new Promise(resolve => setTimeout(resolve, index * 50)); // 错开请求
+        await new Promise(resolve => setTimeout(resolve, index * 30)); // 错开请求
         
         for (const source of getAvailableSources('okx')) {
           try {
-            const fundingUrl = `https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`;
+            const fundingUrl = `https://www.okx.com/api/v5/public/funding-rate?instId=${encodeURIComponent(instId)}`;
             const targetUrl = PROXY_SOURCES[source].url(fundingUrl);
             const isProxy = source !== 'direct';
             
             const response = await smartFetch(targetUrl, {
-              timeout: CONFIG.TIMEOUT_SHORT,
+              timeout: isProxy ? CONFIG.TIMEOUT_PROXY : CONFIG.TIMEOUT_SHORT,
               isProxy
             }, { source, instId });
             
             const data = await response.json();
-            if (data?.data && Array.isArray(data.data) && data.data.length > 0) {
-              return data.data[0]; // 只取最新的
+            // OKX funding-rate endpoint returns { code: '0', data: [...] } or { data: [...] }
+            const payload = Array.isArray(data) ? data : (data?.data || []);
+            if (Array.isArray(payload) && payload.length > 0) {
+              // 取最新一条
+              return payload[0];
             }
           } catch (error) {
             // 继续尝试下一个源
@@ -575,21 +629,24 @@ async function getOKXData() {
       }
     }
     
-    const validResults = fundingResults.filter(item => item && item.instId);
+    const validResults = fundingResults.filter(item => item && (item.instId || item.inst_id || item.instrumentId || item.instrument_id));
     
     if (validResults.length === 0) {
-      throw new Error('未获取到有效的资金费率数据');
+      throw new Error('未获取到有效的OKX资金费率数据');
     }
     
-    console.log(`✅ 成功获取 ${validResults.length} 个OKX资金费率`);
+    // 归一化 OKX 结果
+    const normalized = normalizeOkxArray(validResults, 'okx');
     
-    cache.set(cacheKey, validResults, CONFIG.CACHE_TTL_OKX, {
-      source: 'multiple',
-      count: validResults.length,
+    console.log(`✅ 成功获取并归一化 ${normalized.length} 个OKX资金费率`);
+    
+    cache.set(cacheKey, normalized, CONFIG.CACHE_TTL_OKX, {
+      source: 'okx_multiple',
+      count: normalized.length,
       timestamp: new Date().toISOString()
     });
     
-    return validResults;
+    return normalized;
     
   } catch (error) {
     console.error('❌ OKX数据获取失败:', error.message);
@@ -755,7 +812,7 @@ app.get('/metrics', (req, res) => {
   });
 });
 
-// Binance路由
+// Binance路由（返回归一化数组）
 app.get('/proxy/binance', async (req, res) => {
   try {
     console.log(`🌐 [${req.requestId}] 请求Binance数据 (IP: ${req.clientIp})`);
@@ -805,7 +862,7 @@ app.get('/proxy/binance', async (req, res) => {
   }
 });
 
-// OKX路由
+// OKX路由（返回归一化数组）
 app.get('/proxy/okx', async (req, res) => {
   try {
     console.log(`🌐 [${req.requestId}] 请求OKX数据 (IP: ${req.clientIp})`);
